@@ -24,14 +24,16 @@
  *
  *  Version history
  *
- *  v0.1.06.13.17 - Lowered the wait time for SSDP response to 5s, because ST lowered the page rendering time out to 10s
- *  v0.1.06.21.16 - Added support for Instant, switch level is now 0/home, 1/stay, 2/instant, 3/away. Improved mode handling, replaced attribute "mode" with "digital-life-mode" as it was conflicting with the location mode
- *  v0.1.04.12.16 - Added support for AT&T Digital Life switch (switch is "off" when alarm is disarmed and "on" when the alarm is in stay/away/instant mode)
- *  v0.1.04.06.16b - Added support for switch level (sending event to set the level as well as the mode)
- *  v0.1.04.06.16 - Replaced Follow Location Mode with Sync Location Mode and added Sync Smart Home Monitor option for AT&T. Thank you Keo for the idea
- *  v0.1.03.28.16 - Added Follow Location Mode option for AT&T
- *  v0.1.03.23.16 - Updated location sync method
- *  v0.1.03.22.16 - Initial beta release
+ *  v0.1.18.03.02 - SmartThings is now enforcing TLS 1.2 on all REST clients, DigitalLife is using old Symantec certificates that are not allowed by TLSv1.2. Also added support for automatic bypass.
+ *  v0.1.18.01.16 - Lowered the wait time for SSDP response to 5s, because ST lowered the page rendering time out to 10s
+ *  v0.1.17.06.13 - Lowered the wait time for SSDP response to 5s, because ST lowered the page rendering time out to 10s
+ *  v0.1.16.06.21 - Added support for Instant, switch level is now 0/home, 1/stay, 2/instant, 3/away. Improved mode handling, replaced attribute "mode" with "digital-life-mode" as it was conflicting with the location mode
+ *  v0.1.16.04.12 - Added support for AT&T Digital Life switch (switch is "off" when alarm is disarmed and "on" when the alarm is in stay/away/instant mode)
+ *  v0.1.16.04.06b - Added support for switch level (sending event to set the level as well as the mode)
+ *  v0.1.16.04.06 - Replaced Follow Location Mode with Sync Location Mode and added Sync Smart Home Monitor option for AT&T. Thank you Keo for the idea
+ *  v0.1.16.03.28 - Added Follow Location Mode option for AT&T
+ *  v0.1.16.03.23 - Updated location sync method
+ *  v0.1.16.03.22 - Initial beta release
  *
 **/
 
@@ -160,7 +162,7 @@ def prefModulesPrepare(params) {
     } else {
         state.ihch.localServerIp = settings.hchLocalServerIp
     }
-    
+    log.trace "IP is $state.ihch.localServerIp"
     if (doHCHLogin()) {
     log.trace "HERE 1"
 	    //prefill states for the modules
@@ -234,6 +236,7 @@ def prefATT() {
             }
             section("Permissions") {
 				input("attControllable", "bool", title: "Control AT&T Digital Life", required: true, defaultValue: true)
+				input("attAutoBypass", "bool", title: "Automatically bypass", required: false, defaultValue: true)
 				input("attSyncLocationMode", "bool", title: "Sync Location Mode", required: true, defaultValue: true)
 				input("attSyncSmartHomeMonitor", "bool", title: "Sync Smart Home Monitor", required: true, defaultValue: true)
             }
@@ -416,6 +419,7 @@ private doATTLogin(installing, force) {
 				'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
                 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/48.0.2564.116 Safari/537.36'
             ],
+            tlsVersion: "TLSv1.1",
             body: "source=DLNA&targetURL=https://my-digitallife.att.com/dl/#/authenticate&loginURL=https://my-digitallife.att.com/dl/#/login&userid=${settings.attUsername}&password=${settings.attPassword}"
         ]) { response ->
         	//check response, sometimes they redirect, that's fine, we don't need to follow the redirect, we just need the cookies
@@ -425,7 +429,7 @@ private doATTLogin(installing, force) {
                 //the hard part, get the cookies
 				response.getHeaders('Set-Cookie').each {
                     def cookie = it.value.split(';')[0]
-					cookies.push(cookie)
+					if (!cookie.startsWith('PD_')) cookies.push(cookie)
                     c = c + cookie + '; '
 				}
                 //using the cookies, retrieve the auth tokens
@@ -438,6 +442,7 @@ private doATTLogin(installing, force) {
                         "DNT": "1",
                         "Cookie": c
                     ],
+                    tlsVersion: "TLSv1.1",
 	                body: "domain=DL&appKey=TI_3198CF46D58D3AFD_001"
        			]) { response2 ->
                 	//check response, continue if 200 OK
@@ -472,6 +477,7 @@ private doATTLogin(installing, force) {
 /* Login to MyQ                                                        */
 /***********************************************************************/
 def doMyQLogin(installing, force) {
+return;
 	try {
 	def module_name = 'myq';
     //if cookies haven't expired and unless we need to force a login, we report all is pink
@@ -483,7 +489,7 @@ def doMyQLogin(installing, force) {
     def hch = (installing ? state.ihch : state.hch)
     hch.useMyQ = false
     hch.security[module_name] = [
-    	'enabled': !!(settings.myqUsername || settings.myqPassword),
+    	'enabled': !!(settings.myqUsername && settings.myqPassword),
         'controllable': settings.myqControllable,
         'connected': false
     ]
@@ -751,7 +757,7 @@ def lanEventHandler(evt) {
         }   	
     }
     if (parsedEvent.data && parsedEvent.data.event) {
-	    log.trace "GOT LAN EVENT ${parsedEvent.data.event} and data ${parsedEvent.data.data}"
+	    //log.trace "GOT LAN EVENT ${parsedEvent.data.event} and data ${parsedEvent.data.data}"
         switch (parsedEvent.data.event) {
         	case "init":
                 sendLocalServerCommand state.hch.localServerIp, "init", [
@@ -764,13 +770,12 @@ def lanEventHandler(evt) {
                 break
         }
     }
-    
 }
 
 private sendLocalServerCommand(ip, command, payload) {
 	try {
         ip = ip ?: state.sch.localServerIp
-        log.trace "Received command $command with payload $payload"
+        log.trace "Sending command $command with payload size ${"${groovy.json.JsonOutput.toJson(payload).bytes.encodeBase64()}".size()} to IP $ip"
         log.trace payload
         sendHubCommand(new physicalgraph.device.HubAction(
             method: "GET",
@@ -778,6 +783,7 @@ private sendLocalServerCommand(ip, command, payload) {
             headers: [
                 HOST: "${ip}:42457"
             ],
+            //body: [payload: payload]
             query: payload ? [payload: groovy.json.JsonOutput.toJson(payload).bytes.encodeBase64()] : []
         ))
 	} catch (e) { log.error "Got an error...", e }
@@ -935,6 +941,15 @@ private processEvent(data) {
                                     shmState = "stay"
                                     break                        
                             }
+                            //push that bypass button
+                            if (settings.attAutoBypass && value.contains("Bypass")) {
+                            	def lastRequestedMode = state.lastRequestedMode
+                                def bypassedDeviceList = data["data-bypassed-device-list"]?:''
+                                if (bypassedDeviceList?.size() && (lastRequestedMode in ['Stay', 'Away', 'Instant'])) {
+                            		log.info "Bypass required for $lastRequestedMode mode, automatically bypassing the not ready devices: $bypassedDeviceList"                               
+                            		cmd_digitallife(device, 'digital-life-mode', lastRequestedMode, false, bypassedDeviceList)
+                                }
+                            }
 							if (mode) {
                             	//set device mode
                                 if (value != device.currentValue('digital-life-mode')) {
@@ -1065,7 +1080,7 @@ def proxyCommand(device, command, value) {
 /***********************************************************************/
 /*                  AT&T DIGITAL LIFE MODULE COMMANDS                  */
 /***********************************************************************/
-def cmd_digitallife(device, command, value, retry) {
+def cmd_digitallife(device, command, value, retrying, bypass = '') {
 	//are we allowed to use ATT?
    	def module_name = "digitallife"
 	if (!state.hch.useATT || !(state.hch.security && state.hch.security[module_name] && state.hch.security[module_name].controllable)) {
@@ -1087,9 +1102,10 @@ def cmd_digitallife(device, command, value, retry) {
     	case "digital-life-system":
         	switch (command) {
             	case "digital-life-mode":
+                	state.lastRequestedMode = value
                 	path = "alarm"
                     data = [
-                    		bypass: '',
+                    		bypass: bypass?:'',
                             status: value
                     	]
                 	break;
@@ -1111,6 +1127,7 @@ def cmd_digitallife(device, command, value, retry) {
                     "requestToken": state.hch.security[module_name].requestToken,
                     "Cookie": cookies
                 ],
+                tlsVersion: "TLSv1.1",
                 body: data
             ]) { response ->
                 //check response, continue if 200 OK
@@ -1124,7 +1141,7 @@ def cmd_digitallife(device, command, value, retry) {
             	return "Successfuly sent command to AT&T Digital Life: device ${device} command ${command} value ${value} result ${message}"
             } else {
             	//if we failed and this was already a retry, give up
-            	if (retry) {
+            	if (retrying) {
 		            return "Failed sending command to AT&T Digital Life: ${message}"
                 }
             	//we failed the first time, let's retry
